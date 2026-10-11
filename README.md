@@ -58,7 +58,7 @@ f42ace8b25e64b63adbe54aa67c8249b8fddb83930d6dc2ec5606a5e9e70bd25
 
 ## Wi-Fi Direct 的实际状态
 
-**仍未解决，当前不建议将它作为这套测试设备的首选连接方式。**
+**仍未解决，当前不建议将它作为这套测试设备的连接方式。**
 
 在小米 Mi 10 / Android 11 与 iPhone 16 Pro Max / iOS 18.7.8 的测试中，iPhone 可以看到并手动加入 DIRECT 网络，但网络检测页无法打开，CarPlay 没有画面。关闭 iPhone 的 VPN 后，检测页仍无法打开。
 

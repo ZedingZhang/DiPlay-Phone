@@ -1,0 +1,9 @@
+<resources>
+    <string name="hotspot_network_not_ready">Hotspot network is not ready</string>
+    <string name="first_tcp_timeout">The iPhone did not connect to CarPlay in time</string>
+    <string name="wireless_startup_retries_exhausted">Automatic retries stopped. Check the connection and retry manually.</string>
+    <string name="retry_carplay_connection">Retry connection</string>
+    <string name="settings_call_speakerphone">Calls on the loudspeaker</string>
+    <string name="settings_call_speakerphone_description">For an Android phone or tablet used as the head unit: plays CarPlay calls on its loudspeaker instead of the earpiece and uses its hands-free microphone. Leave off on a car head unit. Applies from the next call.</string>
+    <string name="existing_wifi_network_not_ready">The selected Wi-Fi network is not ready</string>
+</resources>

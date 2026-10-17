@@ -1,0 +1,9 @@
+<resources>
+    <string name="hotspot_network_not_ready">热点网络未就绪</string>
+    <string name="first_tcp_timeout">等待 iPhone 接入 CarPlay 超时</string>
+    <string name="wireless_startup_retries_exhausted">自动重试已停止，请检查连接后手动重试。</string>
+    <string name="retry_carplay_connection">重新连接</string>
+    <string name="settings_call_speakerphone">通话使用扬声器</string>
+    <string name="settings_call_speakerphone_description">适用于用作车机的 Android 手机或平板：CarPlay 通话从扬声器播放而不是听筒，并使用免提麦克风。车机上请保持关闭。从下一次通话开始生效。</string>
+    <string name="existing_wifi_network_not_ready">所选 Wi-Fi 网络未就绪</string>
+</resources>

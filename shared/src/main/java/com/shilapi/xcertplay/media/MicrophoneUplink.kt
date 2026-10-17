@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal class MicrophoneUplink(
     private val config: MicrophoneConfig,
     private val onDiagnostic: (String) -> Unit = {},
+    private val onStopped: () -> Unit = {},
 ) : Closeable {
     private val running = AtomicBoolean(false)
     private val stats = MicrophoneCaptureStats(config, report = { message ->
@@ -76,29 +77,12 @@ internal class MicrophoneUplink(
             return false
         }
         val bufferSize = maxOf(minBuffer * 2, config.frameBytes * 4)
-        val nextRecorder = try {
-            AudioRecord.Builder()
-                .setAudioSource(source)
-                .setAudioFormat(
-                    AndroidAudioFormat.Builder()
-                        .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(config.sampleRate)
-                        .setChannelMask(channelMask)
-                        .build(),
-                )
-                .setBufferSizeInBytes(bufferSize)
-                .build()
-        } catch (error: Exception) {
-            Log.e(TAG, "microphone recorder creation failed", error)
-            stats.failure(MicrophoneFailureStage.RECORDER_CREATION, error)
-            nextEncoder?.close()
-            running.set(false)
-            return false
-        }
-        if (nextRecorder.state != AudioRecord.STATE_INITIALIZED) {
-            Log.w(TAG, "microphone recorder failed to initialize")
-            stats.failure(MicrophoneFailureStage.RECORDER_INITIALIZATION, code = nextRecorder.state)
-            nextRecorder.release()
+        val nextRecorder = createRecorder(source, channelMask, bufferSize)
+            ?: if (source == MediaRecorder.AudioSource.VOICE_RECOGNITION) {
+                stats.useVoiceCommunicationSource()
+                createRecorder(MediaRecorder.AudioSource.VOICE_COMMUNICATION, channelMask, bufferSize)
+            } else null
+        if (nextRecorder == null) {
             nextEncoder?.close()
             running.set(false)
             return false
@@ -136,6 +120,33 @@ internal class MicrophoneUplink(
             release()
             false
         }
+    }
+
+    private fun createRecorder(source: Int, channelMask: Int, bufferSize: Int): AudioRecord? {
+        val recorder = try {
+            AudioRecord.Builder()
+                .setAudioSource(source)
+                .setAudioFormat(
+                    AndroidAudioFormat.Builder()
+                        .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(config.sampleRate)
+                        .setChannelMask(channelMask)
+                        .build(),
+                )
+                .setBufferSizeInBytes(bufferSize)
+                .build()
+        } catch (error: Exception) {
+            Log.e(TAG, "microphone recorder creation failed source=$source", error)
+            stats.failure(MicrophoneFailureStage.RECORDER_CREATION, error)
+            return null
+        }
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            Log.w(TAG, "microphone recorder failed to initialize source=$source")
+            stats.failure(MicrophoneFailureStage.RECORDER_INITIALIZATION, code = recorder.state)
+            recorder.release()
+            return null
+        }
+        return recorder
     }
 
     private fun voiceEffects(sessionId: Int): List<AudioEffect> = listOfNotNull(
@@ -183,6 +194,7 @@ internal class MicrophoneUplink(
         val counters = MicrophoneCounters()
         val routeInfo = { routeType(recorder) }
         var filled = 0
+        var readRestarts = 0
         try {
             while (running.get()) {
                 stats.reading()
@@ -192,6 +204,14 @@ internal class MicrophoneUplink(
                     if (running.get()) {
                         Log.e(TAG, "microphone read failed code=$count")
                         stats.failure(MicrophoneFailureStage.READ, code = count)
+                    }
+                    if (running.get() && count != AudioRecord.ERROR_DEAD_OBJECT &&
+                        readRestarts < MAX_READ_RESTARTS && restartRecording(recorder)) {
+                        readRestarts++
+                        // Do not combine PCM from either side of the recording interruption.
+                        filled = 0
+                        stats.restarted(readRestarts)
+                        continue
                     }
                     return
                 }
@@ -206,6 +226,7 @@ internal class MicrophoneUplink(
                     filled += copied
                     offset += copied
                     if (filled == frame.size) {
+                        stats.level(frame)
                         sendFrame(socket, counters, frame)
                         filled = 0
                     }
@@ -221,7 +242,19 @@ internal class MicrophoneUplink(
             stats.flush(ended = true, routeType = routeInfo)
             running.set(false)
             release()
+            runCatching(onStopped)
         }
+    }
+
+    private fun restartRecording(recorder: AudioRecord): Boolean = try {
+        runCatching { recorder.stop() }
+        Thread.sleep(READ_RESTART_PAUSE_MILLIS)
+        if (!running.get()) false else {
+            recorder.startRecording()
+            recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING
+        }
+    } catch (_: IllegalStateException) {
+        false
     }
 
     private fun sendFrame(socket: DatagramSocket, counters: MicrophoneCounters, frame: ByteArray) {
@@ -236,7 +269,7 @@ internal class MicrophoneUplink(
                 socket = socket,
                 counters = counters,
                 body = body,
-                samples = config.samplesPerPacket,
+                samples = config.rtpSamplesPerPacket,
             )
         }
     }
@@ -320,5 +353,7 @@ internal class MicrophoneUplink(
         const val TAG = "xcertplay-usb"
         const val MIN_READ_BYTES = 2_048
         const val CLOSE_JOIN_MILLIS = 500L
+        const val MAX_READ_RESTARTS = 3
+        const val READ_RESTART_PAUSE_MILLIS = 50L
     }
 }

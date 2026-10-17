@@ -2,9 +2,11 @@ package com.shilapi.xcertplay.media
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioFormat as AndroidAudioFormat
 import android.media.AudioManager
+import android.media.AudioRouting
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecList
@@ -41,19 +43,32 @@ internal class AudioFocusCoordinator(
     private val enabled: Boolean,
     private val report: (String) -> Unit = {},
 ) {
-    private data class Entry(val channel: AudioChannel, val attributes: AudioAttributes)
+    private data class Entry(val channel: AudioChannel, val attributes: AudioAttributes, var appliedVolume: Float = FULL_VOLUME)
 
     private val manager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private val active = LinkedHashMap<AudioTrack, Entry>()
     private var request: AudioFocusRequest? = null
     private var requestedChannel: AudioChannel? = null
-    private val listener = AudioManager.OnAudioFocusChangeListener { change ->
+    private var mediaVolume = FULL_VOLUME
+    private var closed = false
+    private var focusGeneration = 0L
+    private var currentListener = listenerFor(focusGeneration)
+    internal val listener: AudioManager.OnAudioFocusChangeListener get() = currentListener
+
+    private fun listenerFor(generation: Long) = AudioManager.OnAudioFocusChangeListener { change ->
         synchronized(this) {
+            // Android may have queued callbacks before a request was abandoned or replaced.
+            if (generation != focusGeneration || request == null || active.isEmpty()) return@synchronized
             runCatching { report("Audio: focus change=$change activeTracks=${active.size}") }
             when (change) {
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> setVolume(DUCKED_VOLUME)
-                AudioManager.AUDIOFOCUS_GAIN -> setVolume(FULL_VOLUME)
-                // Keep CarPlay audio running on permanent or transient loss. Some head units
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> setMediaVolume(DUCKED_VOLUME)
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                    // This reports a temporary Android focus owner, not a confirmed call.
+                    Log.i(TAG, "Audio: muting media during transient focus loss")
+                    setMediaVolume(0f)
+                }
+                AudioManager.AUDIOFOCUS_GAIN -> setMediaVolume(FULL_VOLUME)
+                // Keep CarPlay audio running on permanent loss. Some head units
                 // do not send a later gain callback after taking focus back.
             }
         }
@@ -61,9 +76,10 @@ internal class AudioFocusCoordinator(
 
     @Synchronized
     fun acquire(track: AudioTrack, channel: AudioChannel, attributes: AudioAttributes) {
-        if (!enabled || manager == null || channel == AudioChannel.NAVIGATION) return
+        if (closed || !enabled || manager == null || channel == AudioChannel.NAVIGATION) return
         active[track] = Entry(channel, attributes)
         refreshRequest()
+        applyMediaVolume(track, active.getValue(track))
     }
 
     @Synchronized
@@ -71,15 +87,32 @@ internal class AudioFocusCoordinator(
         if (active.remove(track) != null) refreshRequest()
     }
 
+    fun onExternalFocusChange(change: Int) {
+        val current = synchronized(this) { currentListener }
+        current.onAudioFocusChange(change)
+    }
+
+    @Synchronized
+    fun close() {
+        if (closed) return
+        closed = true
+        active.clear()
+        refreshRequest()
+    }
+
     private fun refreshRequest() {
         val primary = active.values.maxByOrNull { it.channel.focusPriority() }
         if (primary == null) {
-            request?.let { manager?.abandonAudioFocusRequest(it) }
+            focusGeneration += 1
+            val abandoned = request
             request = null
             requestedChannel = null
+            mediaVolume = FULL_VOLUME
+            abandoned?.let { manager?.abandonAudioFocusRequest(it) }
             return
         }
         if (request != null && requestedChannel == primary.channel) return
+        focusGeneration += 1
         request?.let { manager?.abandonAudioFocusRequest(it) }
         val gain = when (primary.channel) {
             AudioChannel.MEDIA -> AudioManager.AUDIOFOCUS_GAIN
@@ -87,20 +120,31 @@ internal class AudioFocusCoordinator(
             AudioChannel.ASSISTANT -> AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
             AudioChannel.NAVIGATION -> return
         }
+        currentListener = listenerFor(focusGeneration)
         val next = AudioFocusRequest.Builder(gain)
             .setAudioAttributes(primary.attributes)
-            .setOnAudioFocusChangeListener(listener, Handler(Looper.getMainLooper()))
+            .setOnAudioFocusChangeListener(currentListener, Handler(Looper.getMainLooper()))
             .build()
         request = next
         requestedChannel = primary.channel
         val result = manager?.requestAudioFocus(next)
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) setMediaVolume(FULL_VOLUME)
         val line = "Audio: focus requested channel=${primary.channel} gain=$gain granted=$result activeTracks=${active.size}"
         Log.i(TAG, line)
         runCatching { report(line) }
     }
 
-    private fun setVolume(volume: Float) {
-        active.keys.forEach { track -> runCatching { track.setStereoVolume(volume, volume) } }
+    private fun setMediaVolume(volume: Float) {
+        mediaVolume = volume
+        active.forEach { (track, entry) -> applyMediaVolume(track, entry) }
+    }
+
+    private fun applyMediaVolume(track: AudioTrack, entry: Entry) {
+        // Telephony and assistant speech remain audible, and navigation never enters this map.
+        // This changes only the renderer's relative gain, never Android's user stream volume.
+        if (entry.channel != AudioChannel.MEDIA || entry.appliedVolume == mediaVolume) return
+        val applied = runCatching { track.setStereoVolume(mediaVolume, mediaVolume) == AudioTrack.SUCCESS }.getOrDefault(false)
+        if (applied) entry.appliedVolume = mediaVolume
     }
 
     private fun AudioChannel.focusPriority(): Int = when (this) {
@@ -140,6 +184,8 @@ class AndroidMediaSink(
     private val onAudioDiagnostic: (String) -> Unit = {},
     /** True while any music ("media") audio stream is running; called from media threads. */
     private val onMediaAudioChanged: (Boolean) -> Unit = {},
+    /** A phone or tablet can use its loudspeaker for calls; read again for every call. */
+    private val callSpeakerphone: () -> Boolean = { false },
 ) : MediaSink {
     private val appContext = context?.applicationContext
     private val audioManager = appContext?.getSystemService(AudioManager::class.java)
@@ -148,6 +194,12 @@ class AndroidMediaSink(
         audioFocusEnabled,
         onAudioDiagnostic,
     )
+
+    /** The media-key session can own the focus request for this same sink. */
+    fun onMediaAudioFocusChanged(change: Int) {
+        audioFocusCoordinator.onExternalFocusChange(change)
+    }
+
     private val screenStateLock = Any()
     private val activeScreenTypes = mutableSetOf<Int>()
     private val defaultSurface = surface
@@ -159,7 +211,10 @@ class AndroidMediaSink(
     private val microphoneUplinks = ConcurrentHashMap<AudioStreamId, MicrophoneUplink>()
     private val audioModeLock = Any()
     private var communicationModeStream: AudioStreamId? = null
+    private var communicationModeOwner: MicrophoneUplink? = null // guarded by audioModeLock
     private var savedAudioMode = AudioManager.MODE_NORMAL
+    private var callSpeaker: CallSpeaker? = null // guarded by audioModeLock
+    private var earpieceFallbackTried = false // guarded by audioModeLock
     private val pendingVideoCodec = ConcurrentHashMap<Int, VideoCodec>()
     private val videoRecoveryHandlers = ConcurrentHashMap<Int, () -> Unit>()
     private val videoDiagnosticHandlers = ConcurrentHashMap<Int, (String) -> Unit>()
@@ -290,46 +345,95 @@ class AndroidMediaSink(
 
     override fun onMicrophoneStarted(id: AudioStreamId, config: MicrophoneConfig) {
         // This callback runs on the downlink thread; microphone failures must not stop playback.
+        var ownedUplink: MicrophoneUplink? = null
         try {
-            if (config.audioType == "telephony") enterCommunicationMode(id)
-            val uplink = microphoneUplinks.computeIfAbsent(id) { MicrophoneUplink(config, onAudioDiagnostic) }
-            if (!uplink.start()) {
-                microphoneUplinks.remove(id, uplink)
-                restoreAudioMode(id)
+            synchronized(audioModeLock) {
+                val uplink = microphoneUplinks.computeIfAbsent(id) {
+                    lateinit var created: MicrophoneUplink
+                    created = MicrophoneUplink(config, onAudioDiagnostic, onStopped = {
+                        if (microphoneUplinks.remove(id, created)) restoreAudioMode(id, created)
+                    })
+                    created
+                }
+                ownedUplink = uplink
+                if (config.audioType == "telephony") enterCommunicationMode(id, uplink)
+                if (!uplink.start()) {
+                    microphoneUplinks.remove(id, uplink)
+                    restoreAudioMode(id, uplink)
+                }
             }
         } catch (error: Exception) {
             Log.e("xcertplay-usb", "microphone start failed stream=$id", error)
             MicrophoneCaptureStats.reportStartFailure(config, error, onAudioDiagnostic)
-            onMicrophoneStopped(id)
+            ownedUplink?.let { uplink ->
+                microphoneUplinks.remove(id, uplink)
+                try { uplink.close() } finally { restoreAudioMode(id, uplink) }
+            }
         }
     }
 
     override fun onMicrophoneStopped(id: AudioStreamId) {
+        var owner: MicrophoneUplink? = null
+        val uplink = synchronized(audioModeLock) {
+            microphoneUplinks.remove(id).also {
+                // A failed worker may already have removed itself but not restored its mode.
+                owner = it ?: communicationModeOwner.takeIf { communicationModeStream == id }
+            }
+        }
         try {
-            microphoneUplinks.remove(id)?.close()
+            // The worker's completion callback needs audioModeLock; never join under it.
+            uplink?.close()
         } finally {
-            restoreAudioMode(id)
+            owner?.let { restoreAudioMode(id, it) }
         }
     }
 
-    private fun enterCommunicationMode(id: AudioStreamId) {
+    private fun enterCommunicationMode(id: AudioStreamId, owner: MicrophoneUplink) {
         val manager = audioManager ?: return
         synchronized(audioModeLock) {
-            if (communicationModeStream != null) return
+            if (communicationModeStream != null) {
+                if (communicationModeStream != id || communicationModeOwner === owner) return
+                // Finish the old same-id call before saving the new call's original route.
+                restoreAudioMode(id, communicationModeOwner)
+            }
             // Select the HAL communication path before AudioRecord is created.
             savedAudioMode = manager.mode
-            manager.mode = AudioManager.MODE_IN_COMMUNICATION
             communicationModeStream = id
+            communicationModeOwner = owner
+            manager.mode = AudioManager.MODE_IN_COMMUNICATION
+            earpieceFallbackTried = false
+            val speakerRequested = runCatching(callSpeakerphone).getOrDefault(false)
+            if (speakerRequested) callSpeaker = CallSpeaker.on(manager)
             Log.i("xcertplay-usb", "audio mode $savedAudioMode -> ${manager.mode} for telephony stream=$id")
+            runCatching {
+                onAudioDiagnostic("Audio: mode entered communication from=$savedAudioMode now=${manager.mode} stream=$id" +
+                    if (speakerRequested) " loudspeaker=${callSpeaker != null}" else "")
+            }
         }
     }
 
-    private fun restoreAudioMode(id: AudioStreamId?) {
+    /** Some phone-based head units unexpectedly route communication audio to an earpiece. */
+    private fun moveCallToLoudspeaker(id: AudioStreamId) {
+        val manager = audioManager ?: return
+        val line = synchronized(audioModeLock) {
+            if (communicationModeStream != id || callSpeaker != null || earpieceFallbackTried) return
+            earpieceFallbackTried = true
+            callSpeaker = CallSpeaker.on(manager)
+            "Audio: call routed to the earpiece; loudspeaker=${callSpeaker != null} stream=$id"
+        }
+        runCatching { onAudioDiagnostic(line) }
+    }
+
+    private fun restoreAudioMode(id: AudioStreamId?, owner: MicrophoneUplink? = null) {
         val manager = audioManager ?: return
         synchronized(audioModeLock) {
             val active = communicationModeStream ?: return
             if (id != null && id != active) return
+            if (owner != null && communicationModeOwner !== owner) return
             communicationModeStream = null
+            communicationModeOwner = null
+            callSpeaker?.restore()
+            callSpeaker = null
             try {
                 manager.mode = savedAudioMode
                 Log.i("xcertplay-usb", "audio mode restored to ${manager.mode}")
@@ -355,6 +459,7 @@ class AndroidMediaSink(
         videoRecoveryHandlers.clear()
         videoDiagnosticHandlers.clear()
         recoveryExecutor.shutdownNow()
+        audioFocusCoordinator.close()
         audioRenderers.values.forEach(AudioRenderer::close)
         audioRenderers.clear()
         val hadMedia = synchronized(mediaAudioTypes) { mediaAudioTypes.isNotEmpty().also { mediaAudioTypes.clear() } }
@@ -396,7 +501,10 @@ class AndroidMediaSink(
             navigationStreamType,
             mediaBufferMillis,
             onAudioDiagnostic,
-        ).also { audioRenderers[id] = it }
+        ).also {
+            if (format.audioType == "telephony") it.onRoutedToEarpiece = { moveCallToLoudspeaker(id) }
+            audioRenderers[id] = it
+        }
     }
 }
 
@@ -789,6 +897,9 @@ private class AudioRenderer(
     private var trackAttributes: AudioAttributes? = null
     private var mappedChannel: AudioChannel? = null
     private val queue = LinkedBlockingQueue<AudioPacket>(MAX_QUEUED_PACKETS)
+    private val mediaLagGuard = if (format.audioType == "media") MediaPacketLagGuard(format.rtpClockRate) else null
+    @Volatile private var newestRtpSample = 0
+    private var lagRecoveryReports = 0
     @Volatile private var running = true
     @Volatile private var started = false
     private var codec: MediaCodec? = null
@@ -826,6 +937,9 @@ private class AudioRenderer(
     private var bytesPerSecond = 0
     private val bufferProgress = AudioBufferProgress(if (format.channels >= 2) 4 else 2)
     private var underrunsAtPlaybackStart = 0
+    private var clockTrim: MediaClockTrim? = null
+    @Volatile var onRoutedToEarpiece: (() -> Unit)? = null
+    private var routingListener: AudioRouting.OnRoutingChangedListener? = null
     private var lastPcmWriteNs = 0L
     private var rebufferCount = 0
     private var diagnosticStage = "starting"
@@ -845,6 +959,18 @@ private class AudioRenderer(
             val now = System.nanoTime()
             val previous = lastArrivalNs.getAndSet(now)
             if (previous != 0L) maxArrivalGapMs.accumulateAndGet((now - previous) / 1_000_000L, ::maxOf)
+            newestRtpSample = sample
+            // Keep short Wi-Fi catch-up bursts; discard stale undecoded music only after
+            // the >1.5 s backlog persists for another 1.5 s.
+            val removed = mediaLagGuard?.recover(queue, sample, AudioPacket::sample, now) ?: 0
+            if (removed > 0) {
+                packetsDropped.addAndGet(removed)
+                if (lagRecoveryReports < MAX_REBUFFER_REPORTS) {
+                    lagRecoveryReports++
+                    runCatching { report("Audio: stale media packet backlog recovered audioType=${format.audioType} " +
+                        "packetsDiscarded=$removed remaining=${queue.size}") }
+                }
+            }
         }
         if (!started || !queue.offer(AudioPacket(rtp, sample))) {
             if (started) packetsDropped.incrementAndGet()
@@ -1006,11 +1132,21 @@ private class AudioRenderer(
             )
         }
         track = built
+        if (mappedChannel == AudioChannel.PHONE) {
+            val listener = AudioRouting.OnRoutingChangedListener { routing -> checkCallRoute(routing.routedDevice) }
+            if (runCatching { built.addOnRoutingChangedListener(listener, Handler(Looper.getMainLooper())) }.isSuccess) {
+                routingListener = listener
+            }
+        }
         diagnosticStage = "track-attributes"
         trackAttributes = audioTrackAttributesForFocus(built, attributes)
         diagnosticStage = "track-capacity"
         val capacityBytes = built.bufferSizeInFrames * frameBytes
         startThresholdBytes = MediaAudioBuffer.startBytesFor(plan.startBytes, capacityBytes, PREBUFFER_WRITE_CHUNK_BYTES)
+        // Long-running music needs clock correction; calls and prompts keep their exact rate.
+        clockTrim = if (format.audioType == "media") {
+            MediaClockTrim(format.sampleRate, (startThresholdBytes / frameBytes).toLong())
+        } else null
         val trackMetadata = runCatching {
             "api=${Build.VERSION.SDK_INT} trackState=${built.state} trackRate=${built.sampleRate} " +
                 "usage=${trackAttributes?.usage} contentType=${trackAttributes?.contentType} " +
@@ -1211,12 +1347,18 @@ private class AudioRenderer(
     }
 
     private fun sampleTimestampUs(sample: Int): Long =
-        (sample.toLong() and 0xffff_ffffL) * 1_000_000L / format.sampleRate
+        (sample.toLong() and 0xffff_ffffL) * 1_000_000L / format.rtpClockRate.coerceAtLeast(1)
 
     private fun feedCodec(payload: ByteArray, presentationTimeUs: Long) {
         val codec = codec ?: run { decoderUnavailablePackets++; return }
         diagnosticStage = "decoder-input"
-        val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        // A blocking track write can fill the decoder's output. Drain once before a
+        // second bounded input wait instead of dropping 21 ms of music immediately.
+        var index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        if (index < 0 && running) {
+            drainCodec(codec)
+            index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        }
         if (index < 0) {
             inputDropped++
             if (inputDropped == 1) {
@@ -1342,6 +1484,7 @@ private class AudioRenderer(
             writtenFramesThisWindow += framesWritten
             bufferProgress.written(count)
             lastPcmWriteNs = System.nanoTime()
+            if (playbackStarted) trimClock(track)
             if (!playbackStarted) {
                 prebufferBytes += count
                 if (prebufferBytes >= startThresholdBytes) {
@@ -1359,15 +1502,36 @@ private class AudioRenderer(
         playbackStarted = true
     }
 
+    private fun checkCallRoute(device: AudioDeviceInfo?) {
+        if (running && device?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) onRoutedToEarpiece?.invoke()
+    }
+
+    private fun trimClock(track: AudioTrack) {
+        val trim = clockTrim ?: return
+        val now = System.nanoTime()
+        val compressedRtpFrames = mediaLagGuard?.pendingFrames(queue, newestRtpSample, AudioPacket::sample) ?: 0L
+        val compressedPcmFrames = compressedRtpFrames * format.sampleRate / format.rtpClockRate.coerceAtLeast(1)
+        trim.sample(bufferProgress.queuedBytes(track.playbackHeadPosition) / frameBytes, now, compressedPcmFrames)
+        val rate = trim.rateDue(now) ?: return
+        val result = runCatching { track.setPlaybackRate(rate) }.getOrDefault(AudioTrack.ERROR)
+        if (result != AudioTrack.SUCCESS) {
+            clockTrim = null
+            runCatching { report("Audio: clock trim off audioType=${format.audioType} rate=$rate result=$result") }
+        }
+    }
+
     private fun maintainPlaybackBuffer() {
         val track = track ?: return
         if (bufferProgress.shouldRebuffer(mappedChannel == AudioChannel.MEDIA, playbackStarted,
-                track.underrunCount > underrunsAtPlaybackStart, queue.isEmpty(), track.playbackHeadPosition)) {
-            // The hardware buffer has actually drained. Pause without flushing or discarding PCM,
-            // then use the configured start threshold again when music resumes.
+                track.underrunCount > underrunsAtPlaybackStart, queue.isEmpty(), track.playbackHeadPosition,
+                startThresholdBytes / 2L)) {
+            // Retain residual PCM and include it in the restart threshold so a paused
+            // AudioTrack cannot fill up before play() is reached.
             track.pause()
             playbackStarted = false
-            prebufferBytes = 0
+            prebufferBytes = bufferProgress.queuedBytes(track.playbackHeadPosition)
+                .coerceAtMost(startThresholdBytes.toLong()).toInt()
+            lastPcmWriteNs = System.nanoTime()
             rebufferCount++
         }
         // A short final burst may never reach the start threshold. Play it after a bounded wait.
@@ -1393,7 +1557,10 @@ private class AudioRenderer(
             previous?.let { (current - it) and 0xffff_ffffL }
         }
         val queuedFrames = playbackHeadFrames?.let { (totalWrittenFrames - it).coerceAtLeast(0L) }
-        val line = "audio stats audioType=${format.audioType} channel=$mappedChannel " +
+        if (mappedChannel == AudioChannel.PHONE) runCatching { checkCallRoute(currentTrack?.routedDevice) }
+        // The report treats "PHONE " as the iPhone's own logs; keep call playback diagnostics.
+        val channelName = if (mappedChannel == AudioChannel.PHONE) "CALL" else mappedChannel?.name
+        val line = "audio stats audioType=${format.audioType} channel=$channelName " +
             "routeType=${currentTrack?.routedDevice?.type ?: -1} codec=${format.codec} " +
             "trackState=${currentTrack?.state ?: -1} playState=${currentTrack?.playState ?: -1} " +
             "sampleRate=${currentTrack?.sampleRate ?: format.sampleRate} " +
@@ -1407,7 +1574,8 @@ private class AudioRenderer(
             "estimatedQueuedFrames=${queuedFrames ?: -1} writeErrors=$writeErrorsThisWindow " +
             "lastWriteError=${lastWriteErrorCode ?: "none"} zeroWrites=$zeroWritesThisWindow " +
             "partialWrites=$partialWritesThisWindow " +
-            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force"
+            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount " +
+            "playbackRate=${clockTrim?.rate ?: -1} ended=$force"
         Log.i(STATS_TAG, line)
         report(line)
         if (format.codec != AudioCodecKind.LPCM) {
@@ -1476,6 +1644,8 @@ private class AudioRenderer(
         val track = track
         this.track = null
         if (track != null) {
+            routingListener?.let { listener -> runCatching { track.removeOnRoutingChangedListener(listener) } }
+            routingListener = null
             try {
                 track.pause()
             } catch (_: Exception) {
@@ -1509,5 +1679,6 @@ private class AudioRenderer(
         const val STATS_TAG = "DiPlay-AudioStats"
         const val STATS_WINDOW_NS = 5_000_000_000L
         const val DECODED_BUFFER_LOG_INTERVAL = 50
+        const val MAX_REBUFFER_REPORTS = 8
     }
 }

@@ -11,6 +11,7 @@ import android.widget.Switch
 import com.shilapi.xcertplay.airplay.SafeAreaRect
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.orchestration.MfiTarget
+import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
 import java.util.concurrent.ExecutorService
 import org.junit.After
 import org.junit.Assert.*
@@ -144,6 +145,53 @@ class UnifiedSettingsTest {
         saved.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(35, AirPlayPersistence.loadFps(activity))
+    }
+
+    @Test fun thePhoneCallSpeakerChoiceIsAvailableWithoutAdvancedSettingsAndPersists() {
+        create()
+        openSettings()
+        fun speakerSwitch() = views(activity.window.decorView).filterIsInstance<Switch>()
+            .single { it.contentDescription == activity.getString(R.string.settings_call_speakerphone) }
+        assertFalse(speakerSwitch().isChecked)
+        speakerSwitch().performClick()
+        assertTrue(AirPlayPersistence.loadCallSpeakerphone(activity))
+        openSettings()
+        assertTrue(speakerSwitch().isChecked)
+        assertTrue(buttons().any { it.text == activity.getString(R.string.show_advanced_settings) })
+    }
+
+    @Test fun sameLanValidatesItsOwnCredentialsAndCancelKeepsThePhoneHotspot() {
+        create()
+        AirPlayPersistence.saveManualHotspotSsid(activity, "Phone hotspot")
+        AirPlayPersistence.saveManualHotspotPassphrase(activity, "phone-password")
+        activity.javaClass.getDeclaredMethod("onNewIntent", Intent::class.java).apply { isAccessible = true }
+            .invoke(activity, Intent(activity, DiPlayActivity::class.java).putExtra("page", "connection"))
+        buttons().first { it.text.toString().contains(activity.getString(R.string.existing_wifi_title)) }.performClick()
+        val cancelled = dialog()
+        views(cancelled.window!!.decorView).filterIsInstance<EditText>()
+            .first { it.hint == activity.getString(R.string.existing_wifi_ssid) }.setText("Cancelled router")
+        cancelled.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
+        assertEquals(WirelessHotspotMode.MANUAL, AirPlayPersistence.loadWirelessHotspotMode(activity))
+        assertEquals("", AirPlayPersistence.loadExistingWifiSsid(activity))
+
+        buttons().first { it.text.toString().contains(activity.getString(R.string.existing_wifi_title)) }.performClick()
+        val saved = dialog()
+        val fields = views(saved.window!!.decorView).filterIsInstance<EditText>()
+        fields.first { it.hint == activity.getString(R.string.existing_wifi_ssid) }.setText("Lab router")
+        val password = fields.first { it.hint == activity.getString(R.string.existing_wifi_password) }
+        password.setText("short")
+        saved.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+        assertTrue(saved.isShowing)
+        assertEquals(WirelessHotspotMode.MANUAL, AirPlayPersistence.loadWirelessHotspotMode(activity))
+        password.setText("router-password")
+        saved.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(saved.isShowing)
+        assertEquals(WirelessHotspotMode.EXISTING_WIFI, AirPlayPersistence.loadWirelessHotspotMode(activity))
+        assertEquals("Lab router", AirPlayPersistence.loadExistingWifiSsid(activity))
+        assertEquals("router-password", AirPlayPersistence.loadExistingWifiPassphrase(activity))
+        assertEquals("Phone hotspot", AirPlayPersistence.loadManualHotspotSsid(activity))
+        assertEquals("phone-password", AirPlayPersistence.loadManualHotspotPassphrase(activity))
     }
 
     private fun create() {

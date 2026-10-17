@@ -13,7 +13,7 @@ internal class MicrophoneCaptureStats(
     private val report: (String) -> Unit,
     private val nowNs: () -> Long = System::nanoTime,
 ) {
-    private val metadata = metadata(config)
+    private var metadata = metadata(config)
     private var windowStart = nowNs()
     private var readStart = windowStart
     private var capturedBytes = 0L
@@ -27,6 +27,7 @@ internal class MicrophoneCaptureStats(
     private var sendErrors = 0L
     private var lastSentNs: Long? = null
     private var sendGapMaxNs = 0L
+    private var peakSample = 0
     private var routedDeviceType: Int? = null
 
     fun started(routeType: Int?) {
@@ -35,6 +36,11 @@ internal class MicrophoneCaptureStats(
     }
 
     fun reading() { readStart = nowNs() }
+
+    /** Set before capture starts so diagnostics name the source that actually records. */
+    fun useVoiceCommunicationSource() {
+        metadata = metadata.replace("source=VOICE_RECOGNITION", "source=VOICE_COMMUNICATION")
+    }
 
     fun read(count: Int) {
         reads++
@@ -60,6 +66,17 @@ internal class MicrophoneCaptureStats(
 
     fun sendFailed() { sendErrors++ }
 
+    fun level(pcm: ByteArray) {
+        var index = 0
+        while (index + 1 < pcm.size) {
+            val sample = (pcm[index].toInt() and 0xff) or (pcm[index + 1].toInt() shl 8)
+            peakSample = maxOf(peakSample, kotlin.math.abs(sample))
+            index += 2
+        }
+    }
+
+    fun restarted(attempt: Int) { emit("Microphone: recording restarted $metadata attempt=$attempt") }
+
     fun failure(stage: MicrophoneFailureStage, error: Throwable? = null, code: Int? = null) {
         emit(failureMessage(metadata, stage, error, code))
     }
@@ -72,7 +89,7 @@ internal class MicrophoneCaptureStats(
             "captureBytes=$capturedBytes reads=$reads zeroReads=$zeroReads readErrors=$readErrors " +
             "readMaxMs=${readMaxNs / 1_000_000} encodedFrames=$encodedFrames " +
             "emptyEncodedFrames=$emptyEncodedFrames udpSent=$udpSent sendErrors=$sendErrors " +
-            "sendGapMaxMs=${sendGapMaxNs / 1_000_000} ended=$ended")
+            "sendGapMaxMs=${sendGapMaxNs / 1_000_000} peakDbfs=${peakDbfs(peakSample)} ended=$ended")
         windowStart = now
         capturedBytes = 0
         reads = 0
@@ -84,12 +101,16 @@ internal class MicrophoneCaptureStats(
         udpSent = 0
         sendErrors = 0
         sendGapMaxNs = 0
+        peakSample = 0
     }
 
     private fun emit(message: String) { runCatching { report(message) } }
 
     companion object {
         private const val REPORT_INTERVAL_NS = 5_000_000_000L
+
+        internal fun peakDbfs(peak: Int): String =
+            if (peak <= 0) "silent" else Math.round(20 * kotlin.math.log10(peak / 32768.0)).toString()
 
         private fun metadata(config: MicrophoneConfig): String {
             val (type, source) = when (config.audioType) {

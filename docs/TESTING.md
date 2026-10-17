@@ -8,6 +8,10 @@ Include head-unit model, DiLink/Android, iPhone/iOS, wired/wireless, app version
 
 ## Upstream post-v0.2.11 integration
 
+The later selected network, audio, diagnostics and Same LAN source updates are described
+in [UPSTREAM-PHONE-CORE-SYNC.md](UPSTREAM-PHONE-CORE-SYNC.md), including their additional
+device checks. The published `v0.2.11-phone-fixes.2` APK does not contain those changes.
+
 The integration includes the upstream release tag `v0.2.11` at `6014025c653c4dae88d319ce446e0bf1ddb658ea` and subsequent main commits through `e6e7cc0eaf175ef397eee7ac6223eb267cdc68bd`. These main updates have not been published as a newer upstream release. The four phone fixes below must pass together with the upstream regressions before publishing the fork update. The separate draft Wi-Fi Direct investigation in PR #6 is deferred and is not part of this integration. Its unresolved phone connection failure is not claimed fixed by these updates.
 
 The debug package identifies itself as `0.2.11-post-sync-hud-test` to distinguish this snapshot from the earlier release. Check connection and microphone, then exercise the following new phone controls:
